@@ -16,7 +16,7 @@ export default async function handler(req, res) {
 
   if (!token) {
     return res.status(500).json({
-      error: "REPLICATE_API_TOKEN is missing"
+      error: "REPLICATE_API_TOKEN is missing in Vercel Environment Variables"
     });
   }
 
@@ -32,7 +32,7 @@ export default async function handler(req, res) {
         },
         body: JSON.stringify({
           input: {
-            prompt,
+            prompt: prompt,
             aspect_ratio: "16:9",
             resolution: "720p",
             duration: 10,
@@ -44,57 +44,122 @@ export default async function handler(req, res) {
       }
     );
 
-    let prediction = await response.json();
+    const rawResponse = await response.text();
+
+    console.log("Replicate HTTP status:", response.status);
+    console.log("Replicate response:", rawResponse);
+
+    let prediction;
+
+    try {
+      prediction = JSON.parse(rawResponse);
+    } catch (parseError) {
+      return res.status(502).json({
+        error: "Replicate returned an invalid response",
+        status: response.status,
+        response: rawResponse.slice(0, 1000)
+      });
+    }
 
     if (!response.ok) {
-      return res.status(response.status).json({
-        error: prediction.detail || "Replicate request failed",
-        replicate: prediction
+      return res.status(502).json({
+        error: "Replicate rejected the video request",
+        replicate_status: response.status,
+        details: prediction
       });
     }
 
     let attempts = 0;
+    const maxAttempts = 30;
 
     while (
       (prediction.status === "starting" ||
         prediction.status === "processing") &&
-      attempts < 30
+      attempts < maxAttempts
     ) {
-      await new Promise((resolve) => setTimeout(resolve, 4000));
+      await new Promise((resolve) => {
+        setTimeout(resolve, 4000);
+      });
+
+      if (!prediction.urls || !prediction.urls.get) {
+        return res.status(502).json({
+          error: "Replicate did not return a status URL",
+          prediction
+        });
+      }
 
       const statusResponse = await fetch(prediction.urls.get, {
+        method: "GET",
         headers: {
           Authorization: `Bearer ${token}`
         }
       });
 
-      prediction = await statusResponse.json();
+      const statusText = await statusResponse.text();
+
+      console.log("Replicate status check:", statusResponse.status);
+      console.log("Replicate status response:", statusText);
+
+      try {
+        prediction = JSON.parse(statusText);
+      } catch (parseError) {
+        return res.status(502).json({
+          error: "Replicate status response was not valid JSON",
+          status: statusResponse.status,
+          response: statusText.slice(0, 1000)
+        });
+      }
+
       attempts++;
     }
 
     if (prediction.status === "failed") {
-      return res.status(500).json({
-        error: prediction.error || "Video generation failed"
+      return res.status(502).json({
+        error: "Video generation failed",
+        details: prediction.error || prediction
+      });
+    }
+
+    if (prediction.status === "canceled") {
+      return res.status(502).json({
+        error: "Video generation was canceled",
+        details: prediction
       });
     }
 
     if (prediction.status !== "succeeded") {
-      return res.status(202).json({
+      return res.status(504).json({
+        error: "Video generation timed out",
         status: prediction.status,
-        prediction_id: prediction.id,
-        message: "Video generation is still processing"
+        prediction_id: prediction.id
       });
     }
 
-    const videoUrl = Array.isArray(prediction.output)
-      ? prediction.output[0]
-      : prediction.output;
+    let videoUrl = prediction.output;
+
+    if (Array.isArray(videoUrl)) {
+      videoUrl = videoUrl[0];
+    }
+
+    if (videoUrl && typeof videoUrl === "object" && videoUrl.url) {
+      videoUrl = videoUrl.url;
+    }
+
+    if (!videoUrl) {
+      return res.status(502).json({
+        error: "Replicate succeeded but returned no video URL",
+        prediction
+      });
+    }
 
     return res.status(200).json({
+      status: "succeeded",
       video_url: videoUrl,
-      status: "succeeded"
+      prediction_id: prediction.id
     });
   } catch (error) {
+    console.error("Video generation error:", error);
+
     return res.status(500).json({
       error: error.message || "Internal Server Error"
     });
